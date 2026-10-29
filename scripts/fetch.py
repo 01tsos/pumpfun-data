@@ -16,7 +16,7 @@ from solders.pubkey import Pubkey
 PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 CREATE_DISC = bytes.fromhex("e445a52e51cb9a1d")
 DATA_FILE = "data/launches.csv"
-MAX_SIGS = 500
+MAX_SIGS = 2000
 RPC_URL = os.getenv("RPC_URL")
 
 if not RPC_URL:
