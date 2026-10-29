@@ -2,7 +2,7 @@ import os, csv, json, time, requests
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 
-RPC = os.getenv("RPC_URL", "https://api.mainnet-beta.solana.com")
+RPC = os.getenv("RPC_URL", "https://solana-api.projectserum.com")
 PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 CREATE_DISC = bytes.fromhex("e445a52e51cb9a1d")
 CSV_FILE = "data/launches.csv"
