@@ -17,7 +17,7 @@ PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 CREATE_DISC = bytes.fromhex("e445a52e51cb9a1d")
 DATA_FILE = "data/launches.csv"
 MAX_SIGS = 500
-RPC_URL = os.getenv("RPC_URL")  # Set in GitHub Secrets
+RPC_URL = os.getenv("RPC_URL")
 
 if not RPC_URL:
     raise SystemExit("RPC_URL env var required (set in GitHub Secrets)")
@@ -79,16 +79,19 @@ for i, sig in enumerate(signatures):
     if not tx or "meta" not in tx:
         continue
 
-    # Find Create instruction by discriminator
+    # Find Create instruction by discriminator in raw data
     create_ix = None
     for ix in tx["transaction"]["message"]["instructions"]:
-        if "parsed" in ix and ix["parsed"].get("type") == "create":
+        # Check parsed instruction (if available)
+        parsed = ix.get("parsed")
+        if isinstance(parsed, dict) and parsed.get("type") == "create":
             create_ix = ix
             break
         # Fallback: check raw data for discriminator
-        if "data" in ix and isinstance(ix["data"], str):
+        data = ix.get("data")
+        if isinstance(data, str):
             try:
-                if bytes.fromhex(ix["data"]).startswith(CREATE_DISC):
+                if bytes.fromhex(data).startswith(CREATE_DISC):
                     create_ix = ix
                     break
             except Exception:
