@@ -1,72 +1,137 @@
-import os, csv, json, time, requests
-from solders.pubkey import Pubkey
+#!/usr/bin/env python3
+"""
+Fetch pump.fun launches via Solana RPC.
+Run via GitHub Actions every 10 min.
+"""
+import os
+import csv
+import time
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from solders.signature import Signature
+from solders.pubkey import Pubkey
 
-RPC = os.getenv("RPC_URL", "https://solana-api.projectserum.com")
-PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+# ── Config ──────────────────────────────────────────────────────────────
+PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 CREATE_DISC = bytes.fromhex("e445a52e51cb9a1d")
-CSV_FILE = "data/launches.csv"
+DATA_FILE = "data/launches.csv"
+MAX_SIGS = 500
+RPC_URL = os.getenv("RPC_URL")  # Set in GitHub Secrets
 
-os.makedirs("data", exist_ok=True)
+if not RPC_URL:
+    raise SystemExit("RPC_URL env var required (set in GitHub Secrets)")
 
-# Load existing mints to avoid duplicates
-seen = set()
-if os.path.exists(CSV_FILE):
-    with open(CSV_FILE) as f:
-        for row in csv.DictReader(f):
-            seen.add(row["mint"])
+# ── Resilient HTTP Session ──────────────────────────────────────────────
+session = requests.Session()
+retries = Retry(
+    total=5,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["POST"],
+    raise_on_status=False,
+)
+session.mount("https://", HTTPAdapter(max_retries=retries))
 
-def rpc(method, params):
-    r = requests.post(RPC, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=15)
+def rpc(method: str, params: list) -> dict:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    r = session.post(RPC_URL, json=payload, timeout=15)
     r.raise_for_status()
-    return r.json()["result"]
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(f"RPC error: {data['error']}")
+    return data["result"]
 
-# 1. Get recent signatures
-sigs = rpc("getSignaturesForAddress", [str(PROGRAM), {"limit": 500}])
-print(f"Fetched {len(sigs)} signatures")
+# ── Load Existing Mints ─────────────────────────────────────────────────
+existing_mints = set()
+if os.path.exists(DATA_FILE):
+    with open(DATA_FILE, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            existing_mints.add(row["mint"])
 
+print(f"Loaded {len(existing_mints)} existing mints")
+
+# ── Fetch Recent Signatures ─────────────────────────────────────────────
+print("Fetching signatures...")
+sigs_resp = rpc("getSignaturesForAddress", [
+    PROGRAM_ID,
+    {"limit": MAX_SIGS}
+])
+signatures = [sig["signature"] for sig in sigs_resp]
+print(f"Got {len(signatures)} signatures")
+
+# ── Process Each Signature ──────────────────────────────────────────────
 new_rows = []
-for s in sigs:
-    sig = s["signature"]
-    if sig in seen:
+for i, sig in enumerate(signatures):
+    if i % 50 == 0:
+        print(f"  Progress: {i}/{len(signatures)}")
+    
+    try:
+        tx = rpc("getTransaction", [
+            sig,
+            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}
+        ])
+    except Exception as e:
+        print(f"  ⚠️  Failed {sig[:8]}...: {e}")
         continue
-    # 2. Get full transaction
-    tx = rpc("getTransaction", [sig, {"encoding":"jsonParsed","maxSupportedTransactionVersion":1}])
-    if not tx:
-        continue
-    # 3. Find Create instruction
-    for ixg in tx.get("meta",{}).get("innerInstructions",[]):
-        for ix in ixg.get("instructions",[]):
-            if ix.get("programId") == str(PROGRAM):
-                data = ix.get("data","")
-                if data and data.startswith("5Z9"):  # base58 of CREATE_DISC
-                    # Parse mint from token balances
-                    meta = tx["meta"]
-                    pre = {b["accountIndex"]:b for b in meta.get("preTokenBalances",[])}
-                    for post in meta.get("postTokenBalances",[]):
-                        if post["accountIndex"] in pre:
-                            continue
-                        mint = post["mint"]
-                        if mint in seen:
-                            continue
-                        creator = tx["transaction"]["message"]["accountKeys"][0]
-                        ts = tx.get("blockTime", 0)
-                        new_rows.append({
-                            "mint": mint, "creator": creator, "timestamp": ts,
-                            "signature": sig, "launch_date": time.strftime("%Y-%m-%d", time.gmtime(ts))
-                        })
-                        seen.add(mint)
-                        print(f"  New launch: {mint}")
-                        break
 
-# 4. Append to CSV
+    if not tx or "meta" not in tx:
+        continue
+
+    # Find Create instruction by discriminator
+    create_ix = None
+    for ix in tx["transaction"]["message"]["instructions"]:
+        if "parsed" in ix and ix["parsed"].get("type") == "create":
+            create_ix = ix
+            break
+        # Fallback: check raw data for discriminator
+        if "data" in ix and isinstance(ix["data"], str):
+            try:
+                if bytes.fromhex(ix["data"]).startswith(CREATE_DISC):
+                    create_ix = ix
+                    break
+            except Exception:
+                pass
+
+    if not create_ix:
+        continue
+
+    # Extract mint from postTokenBalances (new token account)
+    pre_accounts = {b["accountIndex"] for b in tx["meta"].get("preTokenBalances", [])}
+    mint = None
+    for b in tx["meta"].get("postTokenBalances", []):
+        if b["accountIndex"] not in pre_accounts:
+            mint = b.get("mint")
+            break
+
+    if not mint or mint in existing_mints:
+        continue
+
+    # Creator = fee payer (first account)
+    creator = tx["transaction"]["message"]["accountKeys"][0]["pubkey"]
+    block_time = tx.get("blockTime", int(time.time()))
+    launch_date = time.strftime("%Y-%m-%d", time.gmtime(block_time))
+
+    new_rows.append({
+        "mint": mint,
+        "creator": creator,
+        "timestamp": block_time,
+        "signature": sig,
+        "launch_date": launch_date,
+    })
+    existing_mints.add(mint)
+
+    time.sleep(0.1)  # Rate limit: 10 req/s
+
+# ── Append to CSV ───────────────────────────────────────────────────────
 if new_rows:
-    file_exists = os.path.exists(CSV_FILE)
-    with open(CSV_FILE, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["mint","creator","timestamp","signature","launch_date"])
+    file_exists = os.path.exists(DATA_FILE)
+    with open(DATA_FILE, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["mint", "creator", "timestamp", "signature", "launch_date"])
         if not file_exists:
-            w.writeheader()
-        w.writerows(new_rows)
-    print(f"Added {len(new_rows)} launches")
+            writer.writeheader()
+        writer.writerows(new_rows)
+    print(f"✅ Added {len(new_rows)} new launches")
 else:
-    print("No new launches")
+    print("No new launches found")
