@@ -37,8 +37,8 @@ jobs:
         env:
           RPC_URLS: ${{ secrets.RPC_URLS }}
           RPC_URL: ${{ secrets.RPC_URL }}
-          MAX_SIGNATURE_PAGES: "5"
-          REQUEST_DELAY: "0.12"
+          MAX_SIGNATURE_PAGES: "3"
+          REQUEST_DELAY: "0.15"
         run: python -u scripts/fetch.py
 
       - name: Save collected data
