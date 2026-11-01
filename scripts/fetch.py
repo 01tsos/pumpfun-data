@@ -1,140 +1,575 @@
 #!/usr/bin/env python3
-"""
-Fetch pump.fun launches via Solana RPC.
-Run via GitHub Actions every 10 min.
-"""
-import os
-import csv
-import time
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from solders.signature import Signature
-from solders.pubkey import Pubkey
 
-# ── Config ──────────────────────────────────────────────────────────────
+import csv
+import json
+import os
+import random
+import tempfile
+import time
+from pathlib import Path
+
+import base58
+import requests
+
 PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 CREATE_DISC = bytes.fromhex("e445a52e51cb9a1d")
-DATA_FILE = "data/launches.csv"
-MAX_SIGS = 1000
-RPC_URL = os.getenv("RPC_URL")
 
-if not RPC_URL:
-    raise SystemExit("RPC_URL env var required (set in GitHub Secrets)")
+DATA_FILE = Path("data/launches.csv")
+STATE_FILE = Path("data/collector_state.json")
 
-# ── Resilient HTTP Session ──────────────────────────────────────────────
+CSV_FIELDS = [
+    "mint",
+    "creator",
+    "timestamp",
+    "launch_date",
+    "signature",
+    "name",
+    "symbol",
+    "uri",
+    "source",
+]
+
+DEFAULT_RPC_URLS = [
+    "https://api.mainnet-beta.solana.com",
+    "https://solana-rpc.publicnode.com",
+]
+
+RPC_URLS = [
+    url.strip()
+    for url in (
+        os.getenv("RPC_URLS")
+        or os.getenv("RPC_URL")
+        or ",".join(DEFAULT_RPC_URLS)
+    ).split(",")
+    if url.strip()
+]
+
+MAX_SIGNATURE_PAGES = int(os.getenv("MAX_SIGNATURE_PAGES", "5"))
+PAGE_SIZE = 1000
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.08"))
+
 session = requests.Session()
-retries = Retry(
-    total=5,
-    backoff_factor=1,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["POST"],
-    raise_on_status=False,
-)
-session.mount("https://", HTTPAdapter(max_retries=retries))
+endpoint_index = 0
 
-def rpc(method: str, params: list) -> dict:
-    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-    r = session.post(RPC_URL, json=payload, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(f"RPC error: {data['error']}")
-    return data["result"]
 
-# ── Load Existing Mints ─────────────────────────────────────────────────
-existing_mints = set()
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            existing_mints.add(row["mint"])
+def atomic_write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-print(f"Loaded {len(existing_mints)} existing mints")
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        delete=False,
+    ) as tmp:
+        json.dump(value, tmp, indent=2)
+        tmp.write("\n")
+        temp_name = tmp.name
 
-# ── Fetch Recent Signatures ─────────────────────────────────────────────
-print("Fetching signatures...")
-sigs_resp = rpc("getSignaturesForAddress", [
-    PROGRAM_ID,
-    {"limit": MAX_SIGS}
-])
-signatures = [sig["signature"] for sig in sigs_resp]
-print(f"Got {len(signatures)} signatures")
+    os.replace(temp_name, path)
 
-# ── Process Each Signature ──────────────────────────────────────────────
-new_rows = []
-for i, sig in enumerate(signatures):
-    if i % 50 == 0:
-        print(f"  Progress: {i}/{len(signatures)}")
-    
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+
     try:
-        tx = rpc("getTransaction", [
-            sig,
-            {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1}
-        ])
-    except Exception as e:
-        print(f"  ⚠️  Failed {sig[:8]}...: {e}")
-        continue
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
-    if not tx or "meta" not in tx:
-        continue
 
-    # Find Create instruction by discriminator in raw data
-    create_ix = None
-    for ix in tx["transaction"]["message"]["instructions"]:
-        # Check parsed instruction (if available)
+def load_existing_rows() -> tuple[list[dict], set[str], set[str]]:
+    if not DATA_FILE.exists():
+        return [], set(), set()
+
+    with DATA_FILE.open(newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    existing_mints = {
+        row.get("mint")
+        for row in rows
+        if row.get("mint")
+    }
+
+    existing_signatures = {
+        row.get("signature")
+        for row in rows
+        if row.get("signature")
+    }
+
+    return rows, existing_mints, existing_signatures
+
+
+def write_rows(rows: list[dict]) -> None:
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        newline="",
+        encoding="utf-8",
+        dir=DATA_FILE.parent,
+        delete=False,
+    ) as tmp:
+        writer = csv.DictWriter(
+            tmp,
+            fieldnames=CSV_FIELDS,
+            extrasaction="ignore",
+        )
+        writer.writeheader()
+
+        for row in rows:
+            writer.writerow({
+                field: row.get(field, "")
+                for field in CSV_FIELDS
+            })
+
+        temp_name = tmp.name
+
+    os.replace(temp_name, DATA_FILE)
+
+
+def is_rate_limit_error(text: str) -> bool:
+    text = text.lower()
+    return any(
+        marker in text
+        for marker in [
+            "429",
+            "rate limit",
+            "too many requests",
+            "credits",
+            "throttle",
+        ]
+    )
+
+
+def rpc(method: str, params: list):
+    global endpoint_index
+
+    last_error = None
+    max_attempts = max(6, len(RPC_URLS) * 3)
+
+    for attempt in range(max_attempts):
+        url = RPC_URLS[endpoint_index % len(RPC_URLS)]
+        endpoint_index += 1
+
+        try:
+            response = session.post(
+                url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": method,
+                    "params": params,
+                },
+                timeout=30,
+            )
+
+            if response.status_code == 429:
+                wait = min(30, 2 ** min(attempt, 5))
+                wait += random.uniform(0, 1)
+                print(f"Rate limited by {url}; waiting {wait:.1f}s")
+                time.sleep(wait)
+                continue
+
+            response.raise_for_status()
+            payload = response.json()
+
+            if "error" in payload:
+                message = str(payload["error"])
+
+                if is_rate_limit_error(message):
+                    wait = min(30, 2 ** min(attempt, 5))
+                    wait += random.uniform(0, 1)
+                    print(f"RPC rate limit; waiting {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+
+                raise RuntimeError(message)
+
+            return payload.get("result")
+
+        except Exception as exc:
+            last_error = exc
+            print(f"RPC failure on {url}: {exc}")
+
+            if attempt < max_attempts - 1:
+                time.sleep(min(15, 1 + attempt))
+
+    raise RuntimeError(
+        f"All RPC attempts failed for {method}: {last_error}"
+    )
+
+
+def fetch_signatures(cursor: str | None) -> tuple[list[dict], bool]:
+    """
+    Return signatures newer than the previous cursor.
+
+    Signatures are returned newest first.
+    The boolean indicates whether the old cursor was reached.
+    """
+    collected = []
+    before = None
+
+    if cursor is None:
+        cursor_reached = True
+    else:
+        cursor_reached = False
+
+    for page_number in range(MAX_SIGNATURE_PAGES):
+        config = {
+            "limit": PAGE_SIZE,
+            "commitment": "confirmed",
+        }
+
+        if before:
+            config["before"] = before
+
+        if cursor:
+            config["until"] = cursor
+
+        print(f"Fetching signature page {page_number + 1}")
+
+        page = rpc(
+            "getSignaturesForAddress",
+            [PROGRAM_ID, config],
+        )
+
+        if not page:
+            cursor_reached = True
+            break
+
+        collected.extend(page)
+
+        if cursor and any(
+            item.get("signature") == cursor
+            for item in page
+        ):
+            cursor_reached = True
+            break
+
+        before = page[-1].get("signature")
+
+        if len(page) < PAGE_SIZE:
+            cursor_reached = True
+            break
+
+    return collected, cursor_reached
+
+
+def account_keys(tx: dict) -> list[str]:
+    keys = []
+
+    for item in (
+        tx.get("transaction", {})
+        .get("message", {})
+        .get("accountKeys", [])
+    ):
+        if isinstance(item, dict):
+            keys.append(item.get("pubkey", ""))
+        else:
+            keys.append(str(item))
+
+    return keys
+
+
+def instruction_program_id(ix: dict, keys: list[str]) -> str | None:
+    if ix.get("programId"):
+        return ix["programId"]
+
+    index = ix.get("programIdIndex")
+
+    if isinstance(index, int) and index < len(keys):
+        return keys[index]
+
+    return None
+
+
+def decode_instruction_data(ix: dict) -> bytes | None:
+    data = ix.get("data")
+
+    if not isinstance(data, str):
+        return None
+
+    try:
+        # Solana instruction data is Base58, not hexadecimal.
+        return base58.b58decode(data)
+    except Exception:
+        return None
+
+
+def find_create_instruction(tx: dict):
+    keys = account_keys(tx)
+    instructions = []
+
+    message_instructions = (
+        tx.get("transaction", {})
+        .get("message", {})
+        .get("instructions", [])
+    )
+    instructions.extend(message_instructions)
+
+    for group in tx.get("meta", {}).get("innerInstructions", []):
+        instructions.extend(group.get("instructions", []))
+
+    for ix in instructions:
+        if instruction_program_id(ix, keys) != PROGRAM_ID:
+            continue
+
+        decoded = decode_instruction_data(ix)
+
+        if decoded and decoded[:8] == CREATE_DISC:
+            return ix, decoded
+
         parsed = ix.get("parsed")
-        if isinstance(parsed, dict) and parsed.get("type") == "create":
-            create_ix = ix
-            break
-        # Fallback: check raw data for discriminator
-        data = ix.get("data")
-        if isinstance(data, str):
-            try:
-                if bytes.fromhex(data).startswith(CREATE_DISC):
-                    create_ix = ix
-                    break
-            except Exception:
-                pass
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("type") == "create"
+        ):
+            return ix, b""
 
-    if not create_ix:
-        continue
+    return None, None
 
-    # Extract mint from postTokenBalances (new token account)
-    pre_accounts = {b["accountIndex"] for b in tx["meta"].get("preTokenBalances", [])}
-    mint = None
-    for b in tx["meta"].get("postTokenBalances", []):
-        if b["accountIndex"] not in pre_accounts:
-            mint = b.get("mint")
-            break
 
-    if not mint or mint in existing_mints:
-        continue
+def read_borsh_string(data: bytes, offset: int):
+    if offset + 4 > len(data):
+        return None, offset
 
-    # Creator = fee payer (first account)
-    creator = tx["transaction"]["message"]["accountKeys"][0]["pubkey"]
-    block_time = tx.get("blockTime", int(time.time()))
-    launch_date = time.strftime("%Y-%m-%d", time.gmtime(block_time))
+    length = int.from_bytes(
+        data[offset:offset + 4],
+        byteorder="little",
+    )
+    offset += 4
 
-    new_rows.append({
+    if length < 0 or offset + length > len(data):
+        return None, offset
+
+    value = data[offset:offset + length].decode(
+        "utf-8",
+        errors="replace",
+    )
+
+    return value, offset + length
+
+
+def parse_specs(decoded: bytes) -> tuple[str, str, str]:
+    """
+    pump.fun Create data contains Borsh strings:
+    name, symbol, URI.
+    """
+    if not decoded or len(decoded) <= 8:
+        return "", "", ""
+
+    offset = 8
+    name, offset = read_borsh_string(decoded, offset)
+
+    if name is None:
+        return "", "", ""
+
+    symbol, offset = read_borsh_string(decoded, offset)
+
+    if symbol is None:
+        return name, "", ""
+
+    uri, offset = read_borsh_string(decoded, offset)
+
+    if uri is None:
+        return name, symbol, ""
+
+    return name, symbol, uri
+
+
+def mint_from_balances(tx: dict) -> str | None:
+    meta = tx.get("meta", {})
+
+    pre_mints = {
+        item.get("mint")
+        for item in meta.get("preTokenBalances", [])
+        if item.get("mint")
+    }
+
+    post_mints = [
+        item.get("mint")
+        for item in meta.get("postTokenBalances", [])
+        if item.get("mint")
+    ]
+
+    for mint in post_mints:
+        if mint not in pre_mints:
+            return mint
+
+    # Fallback: any post-token mint.
+    return post_mints[0] if post_mints else None
+
+
+def mint_from_instruction(
+    ix: dict,
+    tx: dict,
+) -> str | None:
+    keys = account_keys(tx)
+    accounts = ix.get("accounts", [])
+
+    if not accounts:
+        return None
+
+    first_account = accounts[0]
+
+    if isinstance(first_account, int):
+        if first_account < len(keys):
+            return keys[first_account]
+        return None
+
+    if isinstance(first_account, str):
+        return first_account
+
+    return None
+
+
+def extract_launch(tx: dict, signature: str) -> dict | None:
+    ix, decoded = find_create_instruction(tx)
+
+    if ix is None:
+        return None
+
+    mint = mint_from_balances(tx)
+
+    if not mint:
+        mint = mint_from_instruction(ix, tx)
+
+    if not mint:
+        return None
+
+    block_time = tx.get("blockTime")
+
+    if not block_time:
+        return None
+
+    creator_keys = account_keys(tx)
+    creator = creator_keys[0] if creator_keys else ""
+
+    name, symbol, uri = parse_specs(decoded or b"")
+
+    return {
         "mint": mint,
         "creator": creator,
         "timestamp": block_time,
-        "signature": sig,
-        "launch_date": launch_date,
-    })
-    existing_mints.add(mint)
+        "launch_date": time.strftime(
+            "%Y-%m-%d",
+            time.gmtime(block_time),
+        ),
+        "signature": signature,
+        "name": name,
+        "symbol": symbol,
+        "uri": uri,
+        "source": "solana_rpc",
+    }
 
-    time.sleep(0.1)  # Rate limit: 10 req/s
 
-# ── Append to CSV ───────────────────────────────────────────────────────
-if new_rows:
-    file_exists = os.path.exists(DATA_FILE)
-    with open(DATA_FILE, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["mint", "creator", "timestamp", "signature", "launch_date"])
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(new_rows)
-    print(f"✅ Added {len(new_rows)} new launches")
-else:
-    print("No new launches found")
+def main() -> None:
+    print(f"Using RPC endpoints: {len(RPC_URLS)}")
+
+    existing_rows, existing_mints, existing_signatures = (
+        load_existing_rows()
+    )
+    state = load_state()
+
+    old_cursor = state.get("last_seen_signature")
+
+    print(f"Existing launches: {len(existing_mints)}")
+    print(f"Previous cursor: {old_cursor or 'none'}")
+
+    signatures, cursor_reached = fetch_signatures(old_cursor)
+
+    if not signatures:
+        print("No signatures returned")
+        return
+
+    newest_signature = signatures[0].get("signature")
+    new_rows = []
+    failed_transactions = 0
+    seen_batch_mints = set()
+
+    # Process oldest first so the CSV grows chronologically.
+    for index, item in enumerate(reversed(signatures), start=1):
+        signature = item.get("signature")
+
+        if not signature:
+            continue
+
+        if signature in existing_signatures:
+            continue
+
+        print(f"Processing transaction {index}/{len(signatures)}")
+
+        try:
+            tx = rpc(
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 1,
+                    },
+                ],
+            )
+        except Exception as exc:
+            failed_transactions += 1
+            print(f"Transaction failed {signature[:12]}...: {exc}")
+            continue
+
+        if not tx:
+            continue
+
+        launch = extract_launch(tx, signature)
+
+        if not launch:
+            continue
+
+        mint = launch["mint"]
+
+        if mint in existing_mints or mint in seen_batch_mints:
+            continue
+
+        new_rows.append(launch)
+        seen_batch_mints.add(mint)
+
+        print(
+            f"NEW LAUNCH: {mint} "
+            f"{launch.get('name', '')} "
+            f"{launch.get('symbol', '')}"
+        )
+
+        time.sleep(REQUEST_DELAY)
+
+    if new_rows:
+        write_rows(existing_rows + new_rows)
+        print(f"Added {len(new_rows)} launches")
+    else:
+        print("No new launches found")
+
+    # Only advance the cursor if we reached the previous cursor
+    # and did not have transaction-level failures.
+    if cursor_reached and failed_transactions == 0:
+        atomic_write_json(
+            STATE_FILE,
+            {
+                "last_seen_signature": newest_signature,
+                "updated_at": int(time.time()),
+                "signatures_scanned": len(signatures),
+                "launches_added": len(new_rows),
+            },
+        )
+        print(f"Cursor advanced to {newest_signature}")
+    else:
+        print(
+            "Cursor was not advanced. "
+            "The next run will retry this range."
+        )
+
+    print(f"Signatures scanned: {len(signatures)}")
+    print(f"Launches added: {len(new_rows)}")
+    print(f"Transaction failures: {failed_transactions}")
+
+
+if __name__ == "__main__":
+    main()
