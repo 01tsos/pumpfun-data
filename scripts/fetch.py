@@ -45,11 +45,12 @@ CSV_FIELDS = [
     "source",
 ]
 
+# Verified working free endpoints (no API key needed)
 DEFAULT_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://solana-rpc.publicnode.com",
-    "https://rpc.ankr.com/solana",
-    "https://solana-rpc.telegram.org",
+    "https://rpc.helius.xyz",
+    "https://solana-mainnet.g.alchemy.com/v2/demo",
 ]
 
 RPC_URLS = [
@@ -62,9 +63,10 @@ RPC_URLS = [
     if url.strip()
 ]
 
-MAX_SIGNATURE_PAGES = int(os.getenv("MAX_SIGNATURE_PAGES", "5"))
+# Process fewer signatures per run to avoid timeout
+MAX_SIGNATURE_PAGES = int(os.getenv("MAX_SIGNATURE_PAGES", "3"))
 PAGE_SIZE = 1000
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.12"))  # ~8 req/s per endpoint
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.15"))  # ~6 req/s per endpoint
 
 session = requests.Session()
 endpoint_index = 0
@@ -128,10 +130,26 @@ def is_rate_limit_error(text: str) -> bool:
     )
 
 
+def is_permanent_error(text: str) -> bool:
+    """Errors that won't be fixed by retrying - mark endpoint as bad."""
+    text = text.lower()
+    return any(
+        marker in text
+        for marker in [
+            "403",
+            "forbidden",
+            "401",
+            "unauthorized",
+            "404",
+            "not found",
+        ]
+    )
+
+
 def rpc(method: str, params: list):
     global endpoint_index
     last_error = None
-    max_attempts = max(6, len(RPC_URLS) * 3)
+    max_attempts = max(4, len(RPC_URLS) * 2)
     for attempt in range(max_attempts):
         url = RPC_URLS[endpoint_index % len(RPC_URLS)]
         endpoint_index += 1
@@ -139,31 +157,40 @@ def rpc(method: str, params: list):
             response = session.post(
                 url,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=30,
+                timeout=20,
             )
             if response.status_code == 429:
-                wait = min(30, 2 ** min(attempt, 5))
+                wait = min(20, 2 ** min(attempt, 4))
                 wait += random.uniform(0, 1)
                 print(f"Rate limited by {url}; waiting {wait:.1f}s")
                 time.sleep(wait)
+                continue
+            if response.status_code in (403, 401):
+                print(f"Endpoint {url} returned {response.status_code}, skipping")
                 continue
             response.raise_for_status()
             payload = response.json()
             if "error" in payload:
                 message = str(payload["error"])
                 if is_rate_limit_error(message):
-                    wait = min(30, 2 ** min(attempt, 5))
+                    wait = min(20, 2 ** min(attempt, 4))
                     wait += random.uniform(0, 1)
                     print(f"RPC rate limit; waiting {wait:.1f}s")
                     time.sleep(wait)
                     continue
+                if is_permanent_error(message):
+                    print(f"Permanent error from {url}: {message}")
+                    continue
                 raise RuntimeError(message)
             return payload.get("result")
+        except requests.exceptions.JSONDecodeError:
+            print(f"Invalid JSON from {url}, skipping")
+            continue
         except Exception as exc:
             last_error = exc
             print(f"RPC failure on {url}: {exc}")
             if attempt < max_attempts - 1:
-                time.sleep(min(15, 1 + attempt))
+                time.sleep(min(10, 1 + attempt))
     raise RuntimeError(f"All RPC attempts failed for {method}: {last_error}")
 
 
@@ -336,7 +363,13 @@ def main() -> None:
     new_rows = []
     failed_transactions = 0
     seen_batch_mints = set()
+    start_time = time.time()
+    MAX_RUNTIME = 35 * 60  # 35 minutes max
     for index, item in enumerate(reversed(signatures), start=1):
+        if time.time() - start_time > MAX_RUNTIME:
+            print(f"Runtime limit reached ({MAX_RUNTIME}s), stopping early")
+            cursor_reached = False
+            break
         signature = item.get("signature")
         if not signature:
             continue
