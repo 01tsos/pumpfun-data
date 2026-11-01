@@ -15,25 +15,22 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 20  # Helius is fast; 20 min plenty
 
     steps:
       - uses: actions/checkout@v4
         with: {persist-credentials: true}
       - uses: actions/setup-python@v5
         with: {python-version: "3.11"}
-      - run: |
-          python -m pip install --upgrade pip
-          pip install requests==2.32.3 base58==2.1.1
+      - run: pip install -q requests base58
       - env:
-          RPC_URLS: ${{ secrets.RPC_URLS }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
           MAX_SIGNATURE_PAGES: "5"
-          REQUEST_DELAY: "0.08"
+          REQUEST_DELAY: "0.02"
         run: python -u scripts/fetch.py
       - run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Add files that exist
           [ -f data/launches.csv ] && git add data/launches.csv
           [ -f data/collector_state.json ] && git add data/collector_state.json
           git diff --cached --quiet || git commit -m "Update pump.fun launch data"
