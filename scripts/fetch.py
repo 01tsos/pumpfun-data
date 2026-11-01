@@ -18,7 +18,6 @@ import requests
 PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 CREATE_DISC = bytes.fromhex("e445a52e51cb9a1d")
 
-# Known mints to exclude (wrapped SOL, stablecoins, etc.)
 EXCLUDED_MINTS = {
     "So11111111111111111111111111111111111111112",  # wrapped SOL
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
@@ -34,24 +33,16 @@ DATA_FILE = Path("data/launches.csv")
 STATE_FILE = Path("data/collector_state.json")
 
 CSV_FIELDS = [
-    "mint",
-    "creator",
-    "timestamp",
-    "launch_date",
-    "signature",
-    "name",
-    "symbol",
-    "uri",
-    "source",
+    "mint", "creator", "timestamp", "launch_date",
+    "signature", "name", "symbol", "uri", "source",
 ]
 
-# Free endpoints - NO API KEY NEEDED
+# Free endpoints - NO API KEY, verified working
 DEFAULT_RPC_URLS = [
     "https://api.mainnet-beta.solana.com",
     "https://solana-rpc.publicnode.com",
     "https://rpc.ankr.com/solana",
     "https://solana.drpc.org",
-    "https://mainnet.rpc.jito.wtf",
 ]
 
 RPC_URLS = [
@@ -64,9 +55,10 @@ RPC_URLS = [
     if url.strip()
 ]
 
-MAX_SIGNATURE_PAGES = int(os.getenv("MAX_SIGNATURE_PAGES", "3"))
+# More signatures, less delay = better coverage within time limit
+MAX_SIGNATURE_PAGES = int(os.getenv("MAX_SIGNATURE_PAGES", "5"))
 PAGE_SIZE = 1000
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.15"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.08"))  # ~12 req/s
 
 session = requests.Session()
 session.headers.update({"User-Agent": "pumpfun-collector/1.0"})
@@ -234,7 +226,7 @@ def find_create_instruction(tx: dict):
     instructions = []
     message_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
     instructions.extend(message_instructions)
-    # BUG FIX: innerInstructions can be None - use .get() with default []
+    # FIX: innerInstructions can be None
     meta = tx.get("meta", {})
     inner_instructions = meta.get("innerInstructions") or []
     for group in inner_instructions:
@@ -330,7 +322,7 @@ def main() -> None:
     failed_transactions = 0
     seen_batch_mints = set()
     start_time = time.time()
-    MAX_RUNTIME = 35 * 60
+    MAX_RUNTIME = 38 * 60  # 38 min (workflow timeout is 40)
     for index, item in enumerate(reversed(signatures), start=1):
         if time.time() - start_time > MAX_RUNTIME:
             print(f"Runtime limit reached ({MAX_RUNTIME}s), stopping early")
