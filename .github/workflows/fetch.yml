@@ -15,7 +15,7 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
 
     steps:
       - name: Check out repository
@@ -38,17 +38,13 @@ jobs:
           RPC_URLS: ${{ secrets.RPC_URLS }}
           RPC_URL: ${{ secrets.RPC_URL }}
           MAX_SIGNATURE_PAGES: "5"
-          REQUEST_DELAY: "0.08"
+          REQUEST_DELAY: "0.12"
         run: python -u scripts/fetch.py
 
       - name: Save collected data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add data/launches.csv data/collector_state.json
-
-          git diff --cached --quiet || \
-            git commit -m "Update pump.fun launch data"
-
+          git diff --cached --quiet || git commit -m "Update pump.fun launch data"
           git push
