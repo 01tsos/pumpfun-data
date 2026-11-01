@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Fetch pump.fun launches via Solana RPC.
+Fetch pump.fun launches via Helius RPC (fast, free tier).
 Run via GitHub Actions every 5 min.
 """
 import os
 import csv
 import json
 import time
-import random
 import tempfile
 from pathlib import Path
 
@@ -37,32 +36,15 @@ CSV_FIELDS = [
     "signature", "name", "symbol", "uri", "source",
 ]
 
-# Free endpoints - NO API KEY, verified working
-DEFAULT_RPC_URLS = [
-    "https://api.mainnet-beta.solana.com",
-    "https://solana-rpc.publicnode.com",
-    "https://rpc.ankr.com/solana",
-    "https://solana.drpc.org",
-]
+# Helius RPC (uses free tier: 1M req/mo)
+HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY')}"
 
-RPC_URLS = [
-    url.strip()
-    for url in (
-        os.getenv("RPC_URLS")
-        or os.getenv("RPC_URL")
-        or ",".join(DEFAULT_RPC_URLS)
-    ).split(",")
-    if url.strip()
-]
-
-# More signatures, less delay = better coverage within time limit
 MAX_SIGNATURE_PAGES = int(os.getenv("MAX_SIGNATURE_PAGES", "5"))
 PAGE_SIZE = 1000
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.08"))  # ~12 req/s
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.02"))
 
 session = requests.Session()
 session.headers.update({"User-Agent": "pumpfun-collector/1.0"})
-endpoint_index = 0
 
 
 def atomic_write_json(path: Path, value: dict) -> None:
@@ -108,62 +90,28 @@ def write_rows(rows: list[dict]) -> None:
     os.replace(temp_name, DATA_FILE)
 
 
-def is_rate_limit_error(text: str) -> bool:
-    text = text.lower()
-    return any(marker in text for marker in ["429", "rate limit", "too many requests", "credits", "throttle", "quota"])
-
-
-def is_permanent_error(text: str) -> bool:
-    text = text.lower()
-    return any(marker in text for marker in ["403", "forbidden", "401", "unauthorized", "404", "not found"])
-
-
 def rpc(method: str, params: list):
-    global endpoint_index
-    last_error = None
-    max_attempts = max(4, len(RPC_URLS) * 2)
-    for attempt in range(max_attempts):
-        url = RPC_URLS[endpoint_index % len(RPC_URLS)]
-        endpoint_index += 1
+    """Helius RPC with simple retry."""
+    for attempt in range(3):
         try:
             response = session.post(
-                url,
+                HELIUS_RPC,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=20,
+                timeout=30,
             )
             if response.status_code == 429:
-                wait = min(20, 2 ** min(attempt, 4))
-                wait += random.uniform(0, 1)
-                print(f"Rate limited by {url}; waiting {wait:.1f}s")
-                time.sleep(wait)
-                continue
-            if response.status_code in (403, 401):
-                print(f"Endpoint {url} returned {response.status_code}, skipping")
+                time.sleep(2 ** attempt)
                 continue
             response.raise_for_status()
             payload = response.json()
             if "error" in payload:
-                message = str(payload["error"])
-                if is_rate_limit_error(message):
-                    wait = min(20, 2 ** min(attempt, 4))
-                    wait += random.uniform(0, 1)
-                    print(f"RPC rate limit; waiting {wait:.1f}s")
-                    time.sleep(wait)
-                    continue
-                if is_permanent_error(message):
-                    print(f"Permanent error from {url}: {message}")
-                    continue
-                raise RuntimeError(message)
+                raise RuntimeError(payload["error"])
             return payload.get("result")
-        except requests.exceptions.JSONDecodeError:
-            print(f"Invalid JSON from {url}, skipping")
-            continue
-        except Exception as exc:
-            last_error = exc
-            print(f"RPC failure on {url}: {exc}")
-            if attempt < max_attempts - 1:
-                time.sleep(min(10, 1 + attempt))
-    raise RuntimeError(f"All RPC attempts failed for {method}: {last_error}")
+        except Exception as e:
+            if attempt == 2:
+                raise
+            time.sleep(1)
+    raise RuntimeError(f"Helius RPC failed for {method}")
 
 
 def fetch_signatures(cursor: str | None) -> tuple[list[dict], bool]:
@@ -226,7 +174,6 @@ def find_create_instruction(tx: dict):
     instructions = []
     message_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
     instructions.extend(message_instructions)
-    # FIX: innerInstructions can be None
     meta = tx.get("meta", {})
     inner_instructions = meta.get("innerInstructions") or []
     for group in inner_instructions:
@@ -307,7 +254,7 @@ def extract_launch(tx: dict, signature: str) -> dict | None:
 
 
 def main() -> None:
-    print(f"Using RPC endpoints: {len(RPC_URLS)}")
+    print(f"Using Helius RPC")
     existing_rows, existing_mints, existing_signatures = load_existing_rows()
     state = load_state()
     old_cursor = state.get("last_seen_signature")
@@ -318,53 +265,80 @@ def main() -> None:
         print("No signatures returned")
         return
     newest_signature = signatures[0].get("signature")
+    
+    to_process = [
+        item for item in reversed(signatures)
+        if item.get("signature") and item["signature"] not in existing_signatures
+    ]
+    print(f"Processing {len(to_process)} new signatures...")
+    
     new_rows = []
     failed_transactions = 0
     seen_batch_mints = set()
+    processed = 0
     start_time = time.time()
-    MAX_RUNTIME = 38 * 60  # 38 min (workflow timeout is 40)
-    for index, item in enumerate(reversed(signatures), start=1):
+    MAX_RUNTIME = 18 * 60  # 18 min (Helius is fast)
+    
+    for index, item in enumerate(to_process, start=1):
         if time.time() - start_time > MAX_RUNTIME:
-            print(f"Runtime limit reached ({MAX_RUNTIME}s), stopping early")
+            print(f"Runtime limit reached, stopping early")
             cursor_reached = False
             break
-        signature = item.get("signature")
-        if not signature:
-            continue
-        if signature in existing_signatures:
-            continue
-        print(f"Processing transaction {index}/{len(signatures)}")
+        
+        signature = item["signature"]
+        processed += 1
+        
+        if processed % 100 == 0:
+            print(f"  Progress: {processed}/{len(to_process)}")
+        
         try:
-            tx = rpc("getTransaction", [signature, {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}])
+            tx = rpc("getTransaction", [
+                signature,
+                {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}
+            ])
         except Exception as exc:
             failed_transactions += 1
             print(f"Transaction failed {signature[:12]}...: {exc}")
             continue
+        
         if not tx:
             continue
+        
         launch = extract_launch(tx, signature)
         if not launch:
             continue
+        
         mint = launch["mint"]
         if mint in existing_mints or mint in seen_batch_mints:
             continue
+        
         new_rows.append(launch)
         seen_batch_mints.add(mint)
         print(f"NEW LAUNCH: {mint} {launch.get('name', '')} {launch.get('symbol', '')}")
+        
         time.sleep(REQUEST_DELAY)
+    
     if new_rows:
         write_rows(existing_rows + new_rows)
         print(f"Added {len(new_rows)} launches")
     else:
         print("No new launches found")
+    
     if cursor_reached and failed_transactions == 0:
-        atomic_write_json(STATE_FILE, {"last_seen_signature": newest_signature, "updated_at": int(time.time()), "signatures_scanned": len(signatures), "launches_added": len(new_rows)})
+        atomic_write_json(STATE_FILE, {
+            "last_seen_signature": newest_signature,
+            "updated_at": int(time.time()),
+            "signatures_scanned": len(signatures),
+            "launches_added": len(new_rows),
+        })
         print(f"Cursor advanced to {newest_signature}")
     else:
         print("Cursor was not advanced. The next run will retry this range.")
+    
     print(f"Signatures scanned: {len(signatures)}")
     print(f"Launches added: {len(new_rows)}")
     print(f"Transaction failures: {failed_transactions}")
+    print(f"Time elapsed: {time.time() - start_time:.0f}s")
 
 
 if __name__ == "__main__":
