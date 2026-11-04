@@ -15,7 +15,7 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # Helius is fast; 20 min plenty
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -34,4 +34,5 @@ jobs:
           [ -f data/launches.csv ] && git add data/launches.csv
           [ -f data/collector_state.json ] && git add data/collector_state.json
           git diff --cached --quiet || git commit -m "Update pump.fun launch data"
+          git pull --rebase origin main
           git push
