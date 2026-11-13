@@ -1,3 +1,4 @@
+from typing import Optional, List, Tuple
 #!/usr/bin/env python3
 """
 Fetch pump.fun launches via Helius RPC (fast, free tier).
@@ -67,7 +68,7 @@ def load_state() -> dict:
         return {}
 
 
-def load_existing_rows() -> tuple[list[dict], set[str], set[str]]:
+def load_existing_rows() -> tuple[List[dict], set[str], set[str]]:
     if not DATA_FILE.exists():
         return [], set(), set()
     with DATA_FILE.open(newline="", encoding="utf-8") as f:
@@ -77,7 +78,7 @@ def load_existing_rows() -> tuple[list[dict], set[str], set[str]]:
     return rows, existing_mints, existing_signatures
 
 
-def write_rows(rows: list[dict]) -> None:
+def write_rows(rows: List[dict]) -> None:
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w", newline="", encoding="utf-8", dir=DATA_FILE.parent, delete=False
@@ -114,7 +115,12 @@ def rpc(method: str, params: list):
     raise RuntimeError(f"Helius RPC failed for {method}")
 
 
-def fetch_signatures(cursor: str | None) -> tuple[list[dict], bool]:
+def fetch_signatures(cursor: Optional[str]) -> Tuple[List[dict], bool]:
+    """
+    Return signatures newer than the previous cursor.
+    Signatures are returned newest first.
+    The boolean indicates whether the old cursor was reached.
+    """
     collected = []
     before = None
     cursor_reached = cursor is None
@@ -122,25 +128,42 @@ def fetch_signatures(cursor: str | None) -> tuple[list[dict], bool]:
         config = {"limit": PAGE_SIZE, "commitment": "confirmed"}
         if before:
             config["before"] = before
-        if cursor:
-            config["until"] = cursor
+        # Don't pass cursor in config; we check manually to get only newer sigs
         print(f"Fetching signature page {page_number + 1}")
         page = rpc("getSignaturesForAddress", [PROGRAM_ID, config])
         if not page:
             cursor_reached = True
             break
-        collected.extend(page)
-        if cursor and any(item.get("signature") == cursor for item in page):
-            cursor_reached = True
-            break
+
+        if cursor:
+            # Find cursor in this page
+            cursor_idx = None
+            for i, item in enumerate(page):
+                if item.get("signature") == cursor:
+                    cursor_idx = i
+                    break
+            if cursor_idx is not None:
+                # Take only signatures before cursor (newer than cursor)
+                collected.extend(page[:cursor_idx])
+                cursor_reached = True
+                break
+            else:
+                collected.extend(page)
+        else:
+            collected.extend(page)
+
         before = page[-1].get("signature")
         if len(page) < PAGE_SIZE:
             cursor_reached = True
             break
+    # If cursor provided but not found after all pages, all collected are newer than cursor
+    if cursor and not cursor_reached:
+        cursor_reached = True
+
     return collected, cursor_reached
 
 
-def account_keys(tx: dict) -> list[str]:
+def account_keys(tx: dict) -> List[str]:
     keys = []
     for item in tx.get("transaction", {}).get("message", {}).get("accountKeys", []):
         if isinstance(item, dict):
@@ -150,7 +173,7 @@ def account_keys(tx: dict) -> list[str]:
     return keys
 
 
-def instruction_program_id(ix: dict, keys: list[str]) -> str | None:
+def instruction_program_id(ix: dict, keys: List[str]) -> Optional[str]:
     if ix.get("programId"):
         return ix["programId"]
     index = ix.get("programIdIndex")
@@ -159,7 +182,7 @@ def instruction_program_id(ix: dict, keys: list[str]) -> str | None:
     return None
 
 
-def decode_instruction_data(ix: dict) -> bytes | None:
+def decode_instruction_data(ix: dict) -> Optional[bytes]:
     data = ix.get("data")
     if not isinstance(data, str):
         return None
@@ -201,7 +224,7 @@ def read_borsh_string(data: bytes, offset: int):
     return value, offset + length
 
 
-def parse_specs(decoded: bytes) -> tuple[str, str, str]:
+def parse_specs(decoded: bytes) -> Tuple[str, str, str]:
     if not decoded or len(decoded) <= 8:
         return "", "", ""
     offset = 8
@@ -217,7 +240,7 @@ def parse_specs(decoded: bytes) -> tuple[str, str, str]:
     return name, symbol, uri
 
 
-def mint_from_balances(tx: dict) -> str | None:
+def mint_from_balances(tx: dict) -> Optional[str]:
     meta = tx.get("meta", {})
     pre_mints = {item.get("mint") for item in meta.get("preTokenBalances", []) if item.get("mint")}
     post_mints = [item.get("mint") for item in meta.get("postTokenBalances", []) if item.get("mint")]
@@ -227,7 +250,7 @@ def mint_from_balances(tx: dict) -> str | None:
     return None
 
 
-def extract_launch(tx: dict, signature: str) -> dict | None:
+def extract_launch(tx: dict, signature: str) -> Optional[dict]:
     ix, decoded = find_create_instruction(tx)
     if ix is None:
         return None
