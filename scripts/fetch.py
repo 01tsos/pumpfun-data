@@ -130,6 +130,7 @@ def fetch_signatures(cursor: Optional[str]) -> Tuple[List[dict], bool]:
             config["before"] = before
         # Don't pass cursor in config; we check manually to get only newer sigs
         print(f"Fetching signature page {page_number + 1}")
+        print(f"DEBUG RPC_URLS: {RPC_URLS}")
         page = rpc("getSignaturesForAddress", [PROGRAM_ID, config])
         if not page:
             cursor_reached = True
