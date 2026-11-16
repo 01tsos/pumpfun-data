@@ -300,7 +300,7 @@ def main() -> None:
     seen_batch_mints = set()
     processed = 0
     start_time = time.time()
-    MAX_RUNTIME = 18 * 60  # 18 min (Helius is fast)
+    MAX_RUNTIME = 19 * 60  # 18 min (Helius is fast)
     
     for index, item in enumerate(to_process, start=1):
         if time.time() - start_time > MAX_RUNTIME:
