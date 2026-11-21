@@ -1,8 +1,8 @@
 from typing import Optional, List, Tuple
 #!/usr/bin/env python3
 """
-Fetch pump.fun launches via Helius RPC (fast, free tier).
-Run via GitHub Actions every 5 min.
+Fetch pump.fun launches via QuickNode RPC.
+Run via cron every 20 min.
 """
 import os
 import csv
@@ -37,15 +37,15 @@ CSV_FIELDS = [
     "signature", "name", "symbol", "uri", "source",
 ]
 
-# Helius RPC (uses free tier: 1M req/mo)
-HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY')}"
+# QuickNode RPC
+QUICKNODE_URL = os.getenv("QUICKNODE_URL") or "https://api.mainnet-beta.solana.com"
+RPC_URL = QUICKNODE_URL
 
 MAX_SIGNATURE_PAGES = 3
 PAGE_SIZE = 1000
 REQUEST_DELAY = 0.15
 
 session = requests.Session()
-session.headers.update({"User-Agent": "pumpfun-collector/1.0"})
 
 
 def atomic_write_json(path: Path, value: dict) -> None:
@@ -68,7 +68,7 @@ def load_state() -> dict:
         return {}
 
 
-def load_existing_rows() -> tuple[List[dict], set[str], set[str]]:
+def load_existing_rows() -> Tuple[List[dict], set, set]:
     if not DATA_FILE.exists():
         return [], set(), set()
     with DATA_FILE.open(newline="", encoding="utf-8") as f:
@@ -91,36 +91,63 @@ def write_rows(rows: List[dict]) -> None:
     os.replace(temp_name, DATA_FILE)
 
 
+def is_rate_limit_error(text: str) -> bool:
+    text = text.lower()
+    return any(marker in text for marker in [
+        "429", "rate limit", "too many requests", "credits", "throttle", "quota"
+    ])
+
+
+def is_permanent_error(text: str) -> bool:
+    text = text.lower()
+    return any(marker in text for marker in [
+        "403", "forbidden", "401", "unauthorized", "404", "not found"
+    ])
+
+
 def rpc(method: str, params: list):
-    """Helius RPC with simple retry."""
-    for attempt in range(3):
+    last_error = None
+    for attempt in range(6):
         try:
             response = session.post(
-                HELIUS_RPC,
+                RPC_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=30,
+                timeout=20,
             )
             if response.status_code == 429:
-                time.sleep(2 ** attempt)
+                wait = min(20, 2 ** min(attempt, 4))
+                wait += 0.5
+                print(f"Rate limited; waiting {wait:.1f}s")
+                time.sleep(wait)
                 continue
+            if response.status_code in (403, 401):
+                raise RuntimeError(f"Auth error: {response.status_code}")
             response.raise_for_status()
             payload = response.json()
             if "error" in payload:
-                raise RuntimeError(payload["error"])
+                message = str(payload["error"])
+                if is_rate_limit_error(message):
+                    wait = min(20, 2 ** min(attempt, 4))
+                    wait += 0.5
+                    print(f"RPC rate limit; waiting {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                if is_permanent_error(message):
+                    raise RuntimeError(message)
+                raise RuntimeError(message)
             return payload.get("result")
-        except Exception as e:
-            if attempt == 2:
-                raise
-            time.sleep(1)
-    raise RuntimeError(f"Helius RPC failed for {method}")
+        except requests.exceptions.JSONDecodeError:
+            print(f"Invalid JSON, retrying")
+            continue
+        except Exception as exc:
+            last_error = exc
+            print(f"RPC failure: {exc}")
+            if attempt < 5:
+                time.sleep(min(10, 1 + attempt))
+    raise RuntimeError(f"All RPC attempts failed for {method}: {last_error}")
 
 
 def fetch_signatures(cursor: Optional[str]) -> Tuple[List[dict], bool]:
-    """
-    Return signatures newer than the previous cursor.
-    Signatures are returned newest first.
-    The boolean indicates whether the old cursor was reached.
-    """
     collected = []
     before = None
     cursor_reached = cursor is None
@@ -128,38 +155,21 @@ def fetch_signatures(cursor: Optional[str]) -> Tuple[List[dict], bool]:
         config = {"limit": PAGE_SIZE, "commitment": "confirmed"}
         if before:
             config["before"] = before
-        # Don't pass cursor in config; we check manually to get only newer sigs
+        if cursor:
+            config["until"] = cursor
         print(f"Fetching signature page {page_number + 1}")
         page = rpc("getSignaturesForAddress", [PROGRAM_ID, config])
         if not page:
             cursor_reached = True
             break
-
-        if cursor:
-            # Find cursor in this page
-            cursor_idx = None
-            for i, item in enumerate(page):
-                if item.get("signature") == cursor:
-                    cursor_idx = i
-                    break
-            if cursor_idx is not None:
-                # Take only signatures before cursor (newer than cursor)
-                collected.extend(page[:cursor_idx])
-                cursor_reached = True
-                break
-            else:
-                collected.extend(page)
-        else:
-            collected.extend(page)
-
+        collected.extend(page)
+        if cursor and any(item.get("signature") == cursor for item in page):
+            cursor_reached = True
+            break
         before = page[-1].get("signature")
         if len(page) < PAGE_SIZE:
             cursor_reached = True
             break
-    # If cursor provided but not found after all pages, all collected are newer than cursor
-    if cursor and not cursor_reached:
-        cursor_reached = True
-
     return collected, cursor_reached
 
 
@@ -197,9 +207,7 @@ def find_create_instruction(tx: dict):
     instructions = []
     message_instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
     instructions.extend(message_instructions)
-    meta = tx.get("meta", {})
-    inner_instructions = meta.get("innerInstructions") or []
-    for group in inner_instructions:
+    for group in tx.get("meta", {}).get("innerInstructions", []):
         instructions.extend(group.get("instructions", []))
     for ix in instructions:
         if instruction_program_id(ix, keys) != PROGRAM_ID:
@@ -242,8 +250,16 @@ def parse_specs(decoded: bytes) -> Tuple[str, str, str]:
 
 def mint_from_balances(tx: dict) -> Optional[str]:
     meta = tx.get("meta", {})
-    pre_mints = {item.get("mint") for item in meta.get("preTokenBalances", []) if item.get("mint")}
-    post_mints = [item.get("mint") for item in meta.get("postTokenBalances", []) if item.get("mint")]
+    pre_mints = {
+        item.get("mint")
+        for item in meta.get("preTokenBalances", [])
+        if item.get("mint")
+    }
+    post_mints = [
+        item.get("mint")
+        for item in meta.get("postTokenBalances", [])
+        if item.get("mint")
+    ]
     for mint in post_mints:
         if mint not in pre_mints and mint not in EXCLUDED_MINTS:
             return mint
@@ -277,7 +293,7 @@ def extract_launch(tx: dict, signature: str) -> Optional[dict]:
 
 
 def main() -> None:
-    print(f"Using Helius RPC")
+    print(f"Using RPC: {RPC_URL}")
     existing_rows, existing_mints, existing_signatures = load_existing_rows()
     state = load_state()
     old_cursor = state.get("last_seen_signature")
@@ -288,80 +304,75 @@ def main() -> None:
         print("No signatures returned")
         return
     newest_signature = signatures[0].get("signature")
-    
-    to_process = [
-        item for item in reversed(signatures)
-        if item.get("signature") and item["signature"] not in existing_signatures
-    ]
-    print(f"Processing {len(to_process)} new signatures...")
-    
     new_rows = []
     failed_transactions = 0
     seen_batch_mints = set()
-    processed = 0
     start_time = time.time()
-    MAX_RUNTIME = 30 * 60  # 18 min (Helius is fast)
-    
-    for index, item in enumerate(to_process, start=1):
+    MAX_RUNTIME = 30 * 60
+    for index, item in enumerate(reversed(signatures), start=1):
         if time.time() - start_time > MAX_RUNTIME:
-            print(f"Runtime limit reached, stopping early")
+            print(f"Runtime limit reached ({MAX_RUNTIME}s), stopping early")
             cursor_reached = False
             break
-        
-        signature = item["signature"]
-        processed += 1
-        
-        if processed % 100 == 0:
-            print(f"  Progress: {processed}/{len(to_process)}")
-        
+        signature = item.get("signature")
+        if not signature:
+            continue
+        if signature in existing_signatures:
+            continue
+        print(f"Processing transaction {index}/{len(signatures)}")
         try:
-            tx = rpc("getTransaction", [
-                signature,
-                {"encoding": "jsonParsed", "commitment": "confirmed", "maxSupportedTransactionVersion": 1}
-            ])
+            tx = rpc(
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "commitment": "confirmed",
+                        "maxSupportedTransactionVersion": 1,
+                    },
+                ],
+            )
         except Exception as exc:
             failed_transactions += 1
             print(f"Transaction failed {signature[:12]}...: {exc}")
             continue
-        
         if not tx:
             continue
-        
         launch = extract_launch(tx, signature)
         if not launch:
             continue
-        
         mint = launch["mint"]
         if mint in existing_mints or mint in seen_batch_mints:
             continue
-        
         new_rows.append(launch)
         seen_batch_mints.add(mint)
-        print(f"NEW LAUNCH: {mint} {launch.get('name', '')} {launch.get('symbol', '')}")
-        
+        print(
+            f"NEW LAUNCH: {mint} "
+            f"{launch.get('name', '')} "
+            f"{launch.get('symbol', '')}"
+        )
         time.sleep(REQUEST_DELAY)
-    
     if new_rows:
         write_rows(existing_rows + new_rows)
         print(f"Added {len(new_rows)} launches")
     else:
         print("No new launches found")
-    
     if cursor_reached and failed_transactions == 0:
-        atomic_write_json(STATE_FILE, {
-            "last_seen_signature": newest_signature,
-            "updated_at": int(time.time()),
-            "signatures_scanned": len(signatures),
-            "launches_added": len(new_rows),
-        })
+        atomic_write_json(
+            STATE_FILE,
+            {
+                "last_seen_signature": newest_signature,
+                "updated_at": int(time.time()),
+                "signatures_scanned": len(signatures),
+                "launches_added": len(new_rows),
+            },
+        )
         print(f"Cursor advanced to {newest_signature}")
     else:
         print("Cursor was not advanced. The next run will retry this range.")
-    
     print(f"Signatures scanned: {len(signatures)}")
     print(f"Launches added: {len(new_rows)}")
     print(f"Transaction failures: {failed_transactions}")
-    print(f"Time elapsed: {time.time() - start_time:.0f}s")
 
 
 if __name__ == "__main__":
