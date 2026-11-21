@@ -40,9 +40,9 @@ CSV_FIELDS = [
 # Helius RPC (uses free tier: 1M req/mo)
 HELIUS_RPC = f"https://mainnet.helius-rpc.com/?api-key={os.getenv('HELIUS_API_KEY')}"
 
-MAX_SIGNATURE_PAGES = int(os.getenv("MAX_SIGNATURE_PAGES", "5"))
-PAGE_SIZE = 1000
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.02"))
+MAX_SIGNATURE_PAGES = 1
+PAGE_SIZE = 100
+REQUEST_DELAY = 0.5
 
 session = requests.Session()
 session.headers.update({"User-Agent": "pumpfun-collector/1.0"})
@@ -300,7 +300,7 @@ def main() -> None:
     seen_batch_mints = set()
     processed = 0
     start_time = time.time()
-    MAX_RUNTIME = 30 * 60  # 18 min (Helius is fast)
+    MAX_RUNTIME = 10 * 60  # 18 min (Helius is fast)
     
     for index, item in enumerate(to_process, start=1):
         if time.time() - start_time > MAX_RUNTIME:
