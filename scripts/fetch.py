@@ -14,19 +14,18 @@ from pathlib import Path
 import base58
 import requests
 
-# ── Config ──────────────────────────────────────────────────────────────
 PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 CREATE_DISC = bytes.fromhex("e445a52e51cb9a1d")
 
 EXCLUDED_MINTS = {
-    "So11111111111111111111111111111111111111112",  # wrapped SOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",   # mSOL
-    "stSOLSo1anaDStStakingD7H4Qw1Qx8X9M9gGzK",       # stSOL
-    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",    # JUP
-    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",   # stUSDC
-    "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",   # jitoSOL
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+    "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "stSOLSo1anaDStStakingD7H4Qw1Qx8X9M9gGzK",
+    "JUPyiwrYFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
+    "7dHbWXmci3dT8UFYWYZweBLXgycu7Y3iL6trKn1Y7ARj",
+    "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4",
 }
 
 DATA_FILE = Path("data/launches.csv")
@@ -37,13 +36,13 @@ CSV_FIELDS = [
     "signature", "name", "symbol", "uri", "source",
 ]
 
-# QuickNode RPC
 QUICKNODE_URL = os.getenv("QUICKNODE_URL") or "https://api.mainnet-beta.solana.com"
 RPC_URL = QUICKNODE_URL
 
-MAX_SIGNATURE_PAGES = 3
-PAGE_SIZE = 1000
-REQUEST_DELAY = 0.15
+# Reduced for QuickNode free tier rate limits
+MAX_SIGNATURE_PAGES = 2      # was 3
+PAGE_SIZE = 500              # was 1000
+REQUEST_DELAY = 0.5          # was 0.15
 
 session = requests.Session()
 
@@ -107,16 +106,16 @@ def is_permanent_error(text: str) -> bool:
 
 def rpc(method: str, params: list):
     last_error = None
-    for attempt in range(6):
+    for attempt in range(8):
         try:
             response = session.post(
                 RPC_URL,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                timeout=20,
+                timeout=30,
             )
             if response.status_code == 429:
-                wait = min(20, 2 ** min(attempt, 4))
-                wait += 0.5
+                wait = min(30, 2 ** min(attempt, 5))
+                wait += 1.0
                 print(f"Rate limited; waiting {wait:.1f}s")
                 time.sleep(wait)
                 continue
@@ -127,8 +126,8 @@ def rpc(method: str, params: list):
             if "error" in payload:
                 message = str(payload["error"])
                 if is_rate_limit_error(message):
-                    wait = min(20, 2 ** min(attempt, 4))
-                    wait += 0.5
+                    wait = min(30, 2 ** min(attempt, 5))
+                    wait += 1.0
                     print(f"RPC rate limit; waiting {wait:.1f}s")
                     time.sleep(wait)
                     continue
@@ -142,8 +141,8 @@ def rpc(method: str, params: list):
         except Exception as exc:
             last_error = exc
             print(f"RPC failure: {exc}")
-            if attempt < 5:
-                time.sleep(min(10, 1 + attempt))
+            if attempt < 7:
+                time.sleep(min(15, 2 + attempt))
     raise RuntimeError(f"All RPC attempts failed for {method}: {last_error}")
 
 
