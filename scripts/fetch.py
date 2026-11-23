@@ -39,10 +39,9 @@ CSV_FIELDS = [
 QUICKNODE_URL = os.getenv("QUICKNODE_URL") or "https://api.mainnet-beta.solana.com"
 RPC_URL = QUICKNODE_URL
 
-# Reduced for QuickNode free tier rate limits
-MAX_SIGNATURE_PAGES = 2      # was 3
-PAGE_SIZE = 500              # was 1000
-REQUEST_DELAY = 0.5          # was 0.15
+MAX_SIGNATURE_PAGES = 2
+PAGE_SIZE = 500
+REQUEST_DELAY = 0.5
 
 session = requests.Session()
 
@@ -356,7 +355,9 @@ def main() -> None:
         print(f"Added {len(new_rows)} launches")
     else:
         print("No new launches found")
-    if cursor_reached and failed_transactions == 0:
+    
+    # Advance cursor if no failures (prevents stuck cursor when >1000 new sigs)
+    if failed_transactions == 0:
         atomic_write_json(
             STATE_FILE,
             {
@@ -368,7 +369,7 @@ def main() -> None:
         )
         print(f"Cursor advanced to {newest_signature}")
     else:
-        print("Cursor was not advanced. The next run will retry this range.")
+        print("Cursor was not advanced due to transaction failures.")
     print(f"Signatures scanned: {len(signatures)}")
     print(f"Launches added: {len(new_rows)}")
     print(f"Transaction failures: {failed_transactions}")
