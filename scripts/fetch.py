@@ -1,6 +1,5 @@
 from typing import Optional, List, Tuple
-#!/usr/bin/env python3
-import os, csv, json, time, tempfile
+import os, csv, json, time, tempfile, random
 from pathlib import Path
 import base58, requests
 
@@ -12,34 +11,38 @@ DATA_FILE = Path("data/launches.csv")
 STATE_FILE = Path("data/collector_state.json")
 CSV_FIELDS = ["mint","creator","timestamp","launch_date","signature","name","symbol","uri","source"]
 
-QUICKNODE_URL = os.getenv("QUICKNODE_URL") or "https://api.mainnet-beta.solana.com"
-RPC_URL = QUICKNODE_URL
+# Three free endpoints - rotate to spread load
+RPC_URLS = [
+    os.getenv("QUICKNODE_URL", "https://wiser-hardworking-crater.solana-mainnet.quiknode.pro/f4b4c699cfe58c8f7ccd0f812308f5b039564bd3/"),
+    "https://solana-rpc.publicnode.com",
+    "https://solana-mainnet.g.alchemy.com/v2/alch_HDCBngOY92gdH30NFx5b3",
+]
+endpoint_idx = 0
 
 MAX_SIGNATURE_PAGES = 2
-PAGE_SIZE = 300
-REQUEST_DELAY = 5.0        # 0.2 req/s for getTransaction
-SIGNATURE_DELAY = 0.5
+PAGE_SIZE = 200
+REQUEST_DELAY = 10.0
 
 session = requests.Session()
 
-def atomic_write_json(path: Path, value: dict) -> None:
+def atomic_write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
         json.dump(value, tmp, indent=2); tmp.write("\n")
         os.replace(tmp.name, path)
 
-def load_state() -> dict:
+def load_state():
     if not STATE_FILE.exists(): return {}
     try: return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except: return {}
 
-def load_existing_rows() -> Tuple[List[dict], set, set]:
+def load_existing_rows():
     if not DATA_FILE.exists(): return [], set(), set()
     with DATA_FILE.open(newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     return rows, {r.get("mint") for r in rows if r.get("mint")}, {r.get("signature") for r in rows if r.get("signature")}
 
-def write_rows(rows: List[dict]) -> None:
+def write_rows(rows):
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8", dir=DATA_FILE.parent, delete=False) as tmp:
         w = csv.DictWriter(tmp, fieldnames=CSV_FIELDS, extrasaction="ignore")
@@ -47,43 +50,53 @@ def write_rows(rows: List[dict]) -> None:
         for r in rows: w.writerow({f: r.get(f, "") for f in CSV_FIELDS})
         os.replace(tmp.name, DATA_FILE)
 
-def is_ratelimit(text: str) -> bool:
+def is_ratelimit(text):
     t = text.lower()
     return any(m in t for m in ["429","rate limit","too many requests","credits","throttle","quota"])
 
-def is_permanent(text: str) -> bool:
+def is_permanent(text):
     t = text.lower()
     return any(m in t for m in ["403","forbidden","401","unauthorized","404","not found"])
 
-def rpc(method: str, params: list):
+def get_rpc_url():
+    global endpoint_idx
+    url = RPC_URLS[endpoint_idx % len(RPC_URLS)]
+    endpoint_idx += 1
+    return url
+
+def rpc(method, params):
+    global endpoint_idx
     last_err = None
-    for attempt in range(10):
+    for attempt in range(8):
+        url = get_rpc_url()
         try:
-            resp = session.post(RPC_URL, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=30)
+            resp = session.post(url, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=30)
             if resp.status_code == 429:
-                wait = min(60, 2 ** min(attempt, 6)) + 2.0
-                print(f"Rate limited; waiting {wait:.1f}s")
+                wait = min(60, 2 ** min(attempt, 5)) + 2.0
+                print(f"Rate limited ({url}); waiting {wait:.1f}s")
                 time.sleep(wait); continue
-            if resp.status_code in (403,401): raise RuntimeError(f"Auth error: {resp.status_code}")
+            if resp.status_code in (403,401):
+                print(f"Auth error ({url}), skipping")
+                continue
             resp.raise_for_status()
             payload = resp.json()
             if "error" in payload:
                 msg = str(payload["error"])
                 if is_ratelimit(msg):
-                    wait = min(60, 2 ** min(attempt, 6)) + 2.0
-                    print(f"RPC rate limit; waiting {wait:.1f}s")
+                    wait = min(60, 2 ** min(attempt, 5)) + 2.0
+                    print(f"RPC rate limit ({url}); waiting {wait:.1f}s")
                     time.sleep(wait); continue
                 if is_permanent(msg): raise RuntimeError(msg)
                 raise RuntimeError(msg)
             return payload.get("result")
         except requests.exceptions.JSONDecodeError:
-            print("Invalid JSON, retrying"); continue
+            print(f"Invalid JSON ({url}), retrying"); continue
         except Exception as e:
-            last_err = e; print(f"RPC failure: {e}")
-            if attempt < 9: time.sleep(min(30, 3 + attempt))
+            last_err = e; print(f"RPC failure ({url}): {e}")
+            if attempt < 7: time.sleep(min(30, 3 + attempt))
     raise RuntimeError(f"All RPC attempts failed for {method}: {last_err}")
 
-def fetch_signatures(cursor: Optional[str]) -> Tuple[List[dict], bool]:
+def fetch_signatures(cursor):
     collected, before, reached = [], None, cursor is None
     for p in range(MAX_SIGNATURE_PAGES):
         cfg = {"limit": PAGE_SIZE, "commitment": "confirmed"}
@@ -96,7 +109,7 @@ def fetch_signatures(cursor: Optional[str]) -> Tuple[List[dict], bool]:
         if cursor and any(i.get("signature") == cursor for i in page): reached = True; break
         before = page[-1].get("signature")
         if len(page) < PAGE_SIZE: reached = True; break
-        time.sleep(SIGNATURE_DELAY)
+        time.sleep(0.5)
     return collected, reached
 
 def account_keys(tx): return [i.get("pubkey","") if isinstance(i,dict) else str(i) for i in tx.get("transaction",{}).get("message",{}).get("accountKeys",[])]
@@ -133,7 +146,7 @@ def read_borsh(data, off):
 def parse_specs(dec):
     if not dec or len(dec) <= 8: return "","",""
     off = 8
-    name, off = read_borsh(dec, off); 
+    name, off = read_borsh(dec, off)
     if name is None: return "","",""
     sym, off = read_borsh(dec, off)
     if sym is None: return name,"",""
@@ -162,7 +175,7 @@ def extract_launch(tx, sig):
             "name": n, "symbol": s, "uri": u, "source": "solana_rpc"}
 
 def main():
-    print(f"Using RPC: {RPC_URL}")
+    print(f"Using {len(RPC_URLS)} endpoints (rotating)")
     rows, mints, sigs = load_existing_rows()
     state = load_state()
     cursor = state.get("last_seen_signature")
